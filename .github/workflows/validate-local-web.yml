@@ -1,80 +1,95 @@
 name: Build EduWork source
+run-name: CI selection probe - ${{ inputs.scenario || github.event.head_commit.message }}
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: [ci/verify-product-selection]
   workflow_dispatch:
+    inputs:
+      scenario:
+        type: choice
+        default: success
+        options: [success, selection-failure, downstream-failure, cancel]
 permissions:
   contents: read
 concurrency:
   group: validate-local-web-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  local-web:
-    runs-on: windows-latest
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
+      integration: ${{ steps.changes.outputs.integration }}
+      packages: ${{ steps.changes.outputs.packages }}
     steps:
       - uses: actions/checkout@v4
         with:
-          path: core
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24.22.1'
-      - name: Select product assembly changes
-        id: changes
-        shell: pwsh
-        run: node core/scripts/ci-changes.mjs
-      - uses: actions/setup-go@v5
-        if: steps.changes.outputs.build == 'true'
+      - id: changes
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+        run: |
+          if [[ "$SCENARIO" == selection-failure ]]; then
+            printf '{invalid' > "$RUNNER_TEMP/invalid-event.json"
+            GITHUB_EVENT_PATH="$RUNNER_TEMP/invalid-event.json" node scripts/ci-changes.mjs
+          else
+            node scripts/ci-changes.mjs
+          fi
+  build:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [first, second]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exercise Actions job scheduling with synthetic work
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+        run: |
+          if [[ "$SCENARIO" == downstream-failure ]]; then exit 1; fi
+          if [[ "$SCENARIO" == cancel ]]; then sleep 300; fi
+          echo 'Synthetic scheduling check completed'
+  integration:
+    needs: select
+    if: needs.select.outputs.integration == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Synthetic integration scheduling check completed'
+  package:
+    needs: select
+    if: needs.select.outputs.packages == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Synthetic package scheduling check completed'
+  result:
+    if: always()
+    needs: [select, build, integration, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          go-version: '1.26.6'
-          cache: false
-      - name: Verify source build and local profile coordination
-        shell: pwsh
-        run: |
-          node --test core/tests/ci-changes.test.mjs core/tests/package-maintenance.test.mjs
-          if ($LASTEXITCODE) { throw 'CI selection checks failed' }
-          node core/scripts/audit-eduwork-distribution.mjs --root core
-          if ($LASTEXITCODE) { throw 'Source audit failed' }
-          node core/scripts/check-source-docs.mjs core
-          if ($LASTEXITCODE) { throw 'Documentation links failed' }
-          node --test core/tests/eduwork-assembly-policy.test.mjs core/scripts/test/npm-runtime.test.mjs core/tests/eduwork-source-reproducibility.test.mjs core/tests/eduwork-upstream-lock.test.mjs core/tests/eduwork-profile-links.test.mjs core/tests/eduwork-web-acceptance-contract.test.mjs
-          if ($LASTEXITCODE) { throw 'Source checks failed' }
-          node --test core/dsh-plugins/component-inventory-native/test/product-inventory.test.mjs core/dsh-plugins/client-ui-component-inventory/test/about.test.mjs
-          if ($LASTEXITCODE) { throw 'About and component inventory checks failed' }
-          node --test core/dsh-plugins/client-ui-branding/test/*.test.mjs
-          if ($LASTEXITCODE) { throw 'Product identity checks failed' }
-          node --test core/dsh-host/test/configuration-documentation.test.mjs core/dsh-host/test/configuration-file.test.mjs core/dsh-host/test/publisher-bootstrap.test.mjs core/dsh-host/test/content-updates.test.mjs core/dsh-electron/tests/content-coordinator.test.mjs core/dsh-electron/tests/configuration-policy.test.mjs core/dsh-electron/tests/desktop-paths.test.mjs core/dsh-electron/tests/desktop-restart.test.mjs core/dsh-electron/tests/mac-sparkle-updates.test.mjs
-          if ($LASTEXITCODE) { throw 'Content lifecycle checks failed' }
-          node --test core/dsh-electron/tests/software-update-control.test.mjs core/dsh-electron/tests/portable-updates-startup.test.mjs core/dsh-electron/tests/startup-failure.test.mjs core/dsh-electron/tests/startup-presentation.test.mjs core/dsh-electron/tests/runtime-access.test.mjs core/dsh-electron/tests/workspace-access.test.mjs core/dsh-plugins/desktop-services/test/workspace-access.test.mjs
-          if ($LASTEXITCODE) { throw 'Updater startup and recovery guidance checks failed' }
-          node --test core/dsh-electron/tests/settings-open-request.test.mjs
-          if ($LASTEXITCODE) { throw 'Tray settings request checks failed' }
-          node --test core/dsh-electron/tests/task-notifications.test.mjs core/dsh-electron/tests/native-vault.test.mjs core/dsh-plugins/notifications/test/*.test.mjs core/scripts/test/plugin-notification-contract.test.mjs
-          if ($LASTEXITCODE) { throw 'Desktop notification checks failed' }
-          node --test core/packages/dsh-desktop-pet/test/page-clock.test.mjs core/packages/dsh-desktop-pet/test/pet-state.test.mjs core/packages/dsh-desktop-pet/test/skin.test.mjs core/dsh-electron/tests/desktop-pet-core.test.mjs
-          if ($LASTEXITCODE) { throw 'Desktop pet checks failed' }
-          node --test core/dsh-electron/tests/host-git-identity.test.mjs
-          if ($LASTEXITCODE) { throw 'Host Git identity checks failed' }
-      - name: Verify Windows updater manifests and archives
-        if: steps.changes.outputs.build == 'true'
-        shell: pwsh
-        run: |
-          node --test core/dsh-electron/tests/updater-manifest.test.mjs core/tests/github-update-package.test.mjs
-          if ($LASTEXITCODE) { throw 'Updater manifest and archive checks failed' }
-      - name: Build and verify the generic local Runtime
-        if: steps.changes.outputs.build == 'true'
-        shell: pwsh
-        run: |
-          # This job validates the current Git checkout, which is not a frozen
-          # release snapshot. The build still audits its actual source inputs.
-          node core/scripts/ci-eduwork-web.mjs --core-root ./core --edition-root ./core --distribution-config config/distributions/generic.json --build-only
-          if ($LASTEXITCODE) { throw 'Node Web assembly failed' }
-      - name: Retain local Web validation evidence
-        if: always() && steps.changes.outputs.build == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: eduwork-local-web-validation
-          retention-days: 7
-          path: core/dist/ci-local-web/evidence/public
-          if-no-files-found: error
+          node-version: '24.22.1'
+      - name: Verify build result
+        run: node scripts/ci-result.mjs
+        env:
+          SELECTION_RESULT: ${{ needs.select.result }}
+          REQUIRED: ${{ needs.select.outputs.build }}
+          RESULTS: ${{ format('["{0}"]', needs.build.result) }}
+      - name: Verify integration result
+        run: node scripts/ci-result.mjs
+        env:
+          SELECTION_RESULT: ${{ needs.select.result }}
+          REQUIRED: ${{ needs.select.outputs.integration }}
+          RESULTS: ${{ format('["{0}"]', needs.integration.result) }}
+      - name: Verify package result
+        run: node scripts/ci-result.mjs
+        env:
+          SELECTION_RESULT: ${{ needs.select.result }}
+          REQUIRED: ${{ needs.select.outputs.packages }}
+          RESULTS: ${{ format('["{0}"]', needs.package.result) }}
