@@ -1,1 +1,1 @@
-Synthetic documentation fixture for CI selection.
+Synthetic documentation fixture for a multi-commit push.
