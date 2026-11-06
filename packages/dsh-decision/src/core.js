@@ -149,3 +149,4 @@ export async function requestDecision({ config, args, fetchImpl, signal }) {
   }
   return validateDecisionResult(await boundedJSON(response), args.questions, config.model)
 }
+
